@@ -35,30 +35,10 @@ import threading
 import argparse
 import ipaddress
 import json
-import platform
 import subprocess
 from collections import defaultdict
 
 from scapy.all import ARP, Ether, srp, sendp, sniff, get_if_addr, get_if_hwaddr, conf
-
-_OS = platform.system()  # 'Linux' | 'Windows' | 'Darwin'
-IS_WIN = _OS == "Windows"
-IS_MAC = _OS == "Darwin"
-IS_LINUX = _OS == "Linux"
-
-
-def is_admin():
-    """Root on Unix, Administrator on Windows (raw sockets need it)."""
-    if IS_WIN:
-        try:
-            import ctypes
-            return ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            return False
-    try:
-        return os.geteuid() == 0
-    except AttributeError:
-        return False  # non-Unix without geteuid: assume not privileged
 
 BANNER = r"""
   #     ##### #   # #####  #### #   # #####
