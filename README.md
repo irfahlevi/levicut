@@ -34,7 +34,7 @@ their internet, and protect your own connection from ARP spoofing.
 ## Installation
 
 ```bash
-git clone https://github.com/<you>/levicut.git
+git clone https://github.com/irfahlevi/levicut.git
 cd levicut
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
