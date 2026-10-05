@@ -36,7 +36,6 @@ import argparse
 import ipaddress
 import json
 import subprocess
-from collections import defaultdict
 
 from scapy.all import ARP, Ether, srp, sendp, sniff, get_if_addr, get_if_hwaddr, conf
 
@@ -71,6 +70,7 @@ OUI_PATHS = [
     "/usr/share/nmap/nmap-mac-prefixes",
 ]
 _oui_cache = {}
+_oui_loaded = False
 
 
 # --------------------------------------------------------------------------- #
@@ -159,8 +159,10 @@ def my_ap_info(iface):
 
 
 def load_oui():
-    if _oui_cache:
+    global _oui_loaded
+    if _oui_loaded:
         return _oui_cache
+    _oui_loaded = True  # set first: never re-parse 35k lines twice in one run
     for path in OUI_PATHS:
         if not os.path.exists(path):
             continue
@@ -184,17 +186,22 @@ def vendor_of(mac):
     return hit or VENDOR_FALLBACK.get(prefix)
 
 
+def rdns_lookup(ip, timeout=1.0):
+    """Reverse-DNS as a blocking call. Callers run this on a worker thread that
+    they already join with a timeout, so it must not spawn a thread of its own
+    (nesting one per host per name-lookup is what blew up scan thread counts)."""
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return None
+
+
 def hostname_of(ip, timeout=1.0):
-    """Reverse-DNS without hanging the scan (thread + timeout)."""
+    """Reverse-DNS with a hard timeout, for callers with no worker thread.
+    gethostbyaddr ignores socket timeouts, so the timeout needs a thread."""
     result = [None]
-
-    def _r():
-        try:
-            result[0] = socket.gethostbyaddr(ip)[0]
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_r, daemon=True)
+    t = threading.Thread(target=lambda: result.__setitem__(
+        0, rdns_lookup(ip)), daemon=True)
     t.start()
     t.join(timeout)
     return result[0]
@@ -211,8 +218,9 @@ OS_PORTS = {  # port -> (tag, weight): what an open port tells us
     554: ("RTSP-cam", 1), 631: ("IPP-print", 1), 548: ("AFP-Mac", 2),
     62078: ("iOS-lockdown", 3), 7000: ("AirPlay", 2), 7001: ("AirPlay", 2),
     5000: ("UPnP/SSDP", 1), 8008: ("Chromecast", 2), 8009: ("Chromecast", 2),
-    5555: ("Android-ADB", 3), 22: ("SSH", 1), 80: ("HTTP", 0), 443: ("HTTPS", 0),
+    5555: ("Android-ADB", 3), 22: ("SSH", 1),
 }
+
 
 # vendor keyword -> likely OS family (checked against ieee-oui vendor string)
 VENDOR_OS = [
@@ -491,9 +499,20 @@ def netbios_status(ip, timeout=1.0):
             pass
 
 
+def _generic_name(name):
+    """True for mDNS names that carry no information ('host.local', 'x.local')."""
+    if not name:
+        return True
+    n = name.lower().removesuffix(".local").strip()
+    # a bare 1-2 char label identifies nothing, whatever it is
+    return len(n) < 3 or n in ("host", "device", "pc", "laptop", "desktop",
+                               "unknown", "default")
+
+
 def best_hostname(ip, timeout=1.0):
-    """mDNS (.local names) -> NetBIOS (Windows names) -> reverse DNS.
-    Runs the three in parallel; returns (hostname, nb_server_flag)."""
+    """Names, in order of usefulness: NetBIOS (explicit Windows name) ->
+    meaningful mDNS -> reverse DNS. A bare 'host.local' loses to a real
+    NetBIOS name. The three run in parallel; returns (hostname, nb_server)."""
     res = {}
 
     def _m():
@@ -501,7 +520,7 @@ def best_hostname(ip, timeout=1.0):
     def _n():
         res["nb"] = netbios_status(ip)
     def _r():
-        res["rdns"] = hostname_of(ip, timeout)
+        res["rdns"] = rdns_lookup(ip)
 
     ts = [threading.Thread(target=f, daemon=True) for f in (_m, _n, _r)]
     for t in ts:
@@ -509,7 +528,13 @@ def best_hostname(ip, timeout=1.0):
     for t in ts:
         t.join(3)
     nb_name, nb_server = res.get("nb") or (None, False)
-    return res.get("mdns") or nb_name or res.get("rdns"), nb_server
+    mdns = res.get("mdns")
+    rdns = res.get("rdns")
+    if nb_name:
+        return nb_name, nb_server
+    if mdns and not _generic_name(mdns):
+        return mdns, nb_server
+    return rdns or mdns, nb_server
 
 
 def ssdp_discover(timeout=4):
@@ -622,10 +647,21 @@ class Whitelist:
         try:
             with open(self.path) as f:
                 data = json.load(f)
-            # normalize keys
-            self.entries = {self.norm_mac(k): v for k, v in data.items()}
-        except (OSError, ValueError):
+        except FileNotFoundError:
             self.entries = {}
+            return
+        except (OSError, ValueError) as e:
+            print(f"[!] could not read {self.path}: {e} — "
+                  "starting with an empty whitelist")
+            self.entries = {}
+            return
+        if not isinstance(data, dict):
+            print(f"[!] {self.path} is not a JSON object — ignoring it "
+                  "(expected {MAC: {...}})")
+            self.entries = {}
+            return
+        # normalize keys
+        self.entries = {self.norm_mac(k): v for k, v in data.items()}
 
     def save(self):
         try:
@@ -785,15 +821,28 @@ class DeviceCache:
     def load(self):
         try:
             with open(self.path) as f:
-                self.known = json.load(f)
-        except (OSError, ValueError):
+                data = json.load(f)
+        except FileNotFoundError:
             self.known = {}
+            return
+        except (OSError, ValueError) as e:
+            print(f"[!] could not read device cache {self.path}: {e} — "
+                  "starting empty (it will be rebuilt on the next scan)")
+            self.known = {}
+            return
+        if not isinstance(data, dict):
+            print(f"[!] {self.path} is not a JSON object — ignoring it "
+                  "(expected {MAC: {...}})")
+            self.known = {}
+            return
+        self.known = data
 
     def save(self):
         try:
             now = time.time()
             self.known = {m: i for m, i in self.known.items()
-                          if now - i.get("last_seen", 0) < CACHE_PRUNE_AGE}
+                          if isinstance(i, dict)
+                          and now - i.get("last_seen", 0) < CACHE_PRUNE_AGE}
             with open(self.path, "w") as f:
                 json.dump(self.known, f, indent=2)
         except OSError as e:
@@ -815,6 +864,8 @@ class DeviceCache:
         live = {Whitelist.norm_mac(m) for m in live_macs}
         out = []
         for mac, info in self.known.items():
+            if not isinstance(info, dict):
+                continue  # hand-edited / corrupted entry: skip, don't crash
             if mac in live or now - info.get("last_seen", 0) > max_age:
                 continue
             out.append({"ip": info.get("ip", "?"), "mac": mac,
@@ -968,6 +1019,7 @@ class Blocker:
         self._lock = threading.Lock()
         self.sent = {}    # ip -> forged packets sent (proof the block is live)
         self.since = {}   # ip -> epoch when blocking started
+        self.macs = {}    # ip -> victim MAC we were told about at block() time
 
     def _loop(self, ip, mac, stop):
         net = self.net
@@ -993,38 +1045,59 @@ class Blocker:
             self._threads[ip] = t
             self.sent[ip] = 0
             self.since[ip] = time.time()
+            if mac:
+                self.macs[ip] = mac
             t.start()
             return True
 
-    def _restore(self, ip, mac):
+    def _restore(self, ip, mac=None):
+        """Push correct ARP entries back. With a known victim MAC we can also
+        fix the gateway's entry for it; without one we broadcast the truth so
+        every host (incl. the victim) drops the poisoned mapping."""
         net = self.net
-        pkt = arp_reply(mac, ip, net.gateway_ip, net.gateway_mac)
-        gw_fix = arp_reply(net.gateway_mac, net.gateway_ip, ip, mac)
-        for _ in range(5):
-            send_arp(pkt, net.iface)
-            if self.full:
-                send_arp(gw_fix, net.iface)
-            time.sleep(0.2)
+        if mac:
+            pkt = arp_reply(mac, ip, net.gateway_ip, net.gateway_mac)
+            gw_fix = arp_reply(net.gateway_mac, net.gateway_ip, ip, mac)
+            for _ in range(5):
+                send_arp(pkt, net.iface)
+                if self.full:
+                    send_arp(gw_fix, net.iface)
+                time.sleep(0.2)
+        else:
+            # unknown victim MAC -> broadcast 'gateway is-at <real mac>'
+            fix = arp_reply(BROADCAST, net.gateway_ip,
+                            net.gateway_ip, net.gateway_mac)
+            for _ in range(3):
+                send_arp(fix, net.iface)
+                time.sleep(0.1)
 
     def unblock(self, ip, mac=None):
         with self._lock:
             stop = self._stops.pop(ip, None)
             t = self._threads.pop(ip, None)
+            # fall back to the MAC we were given at block() time, so an unblock
+            # by bare IP still repairs the victim precisely instead of only
+            # broadcasting.
+            mac = mac or self.macs.get(ip)
+            self.macs.pop(ip, None)
         if stop is None:
             return False
         stop.set()
         if t:
             t.join(timeout=SPOOF_INTERVAL + 1)
-        if mac:
-            self._restore(ip, mac)
+        self._restore(ip, mac)  # broadcasts when mac is None
         with self._lock:
             self.sent.pop(ip, None)
             self.since.pop(ip, None)
         return True
 
     def unblock_all(self, known):
+        # MACs captured at block() time are the reliable source; known_map() is
+        # a snapshot from the last scan and may have missed or renamed hosts.
+        with self._lock:
+            macs = dict(self.macs)
         for ip in list(self._threads.keys()):
-            self.unblock(ip, known.get(ip))
+            self.unblock(ip, known.get(ip) or macs.get(ip))
 
     @property
     def active(self):
@@ -1057,6 +1130,7 @@ class Limiter:
         self._lock = threading.Lock()
         self.sent = {}
         self.since = {}
+        self._macs = {}  # ip -> victim MAC, remembered so unlimit can repair
 
     def _loop(self, ip, mac, stop):
         net = self.net
@@ -1090,6 +1164,8 @@ class Limiter:
             self.pct[ip] = pct
             self.sent[ip] = 0
             self.since[ip] = time.time()
+            if mac:
+                self._macs[ip] = mac
             t = threading.Thread(target=self._loop, args=(ip, mac, stop), daemon=True)
             self._stops[ip] = stop
             self._threads[ip] = t
@@ -1100,6 +1176,8 @@ class Limiter:
         with self._lock:
             stop = self._stops.pop(ip, None)
             t = self._threads.pop(ip, None)
+            mac = mac or self._macs.get(ip)
+            self._macs.pop(ip, None)
             self.pct.pop(ip, None)
             self.sent.pop(ip, None)
             self.since.pop(ip, None)
@@ -1108,13 +1186,22 @@ class Limiter:
         stop.set()
         if t:
             t.join(timeout=SPOOF_INTERVAL + 1)
+        net = self.net
         if mac:  # repair victim ARP
-            pkt = arp_reply(mac, ip, self.net.gateway_ip, self.net.gateway_mac)
+            pkt = arp_reply(mac, ip, net.gateway_ip, net.gateway_mac)
             for _ in range(3):
-                send_arp(pkt, self.net.iface)
+                send_arp(pkt, net.iface)
+        else:
+            # MAC unknown: broadcast so the victim drops the poisoned entry.
+            fix = arp_reply(BROADCAST, net.gateway_ip, net.gateway_ip,
+                            net.gateway_mac)
+            for _ in range(3):
+                send_arp(fix, net.iface)
         return True
 
     def unlimit_all(self, known):
+        # unlimit() falls back to the MAC remembered at limit() time, so a
+        # stale/empty known-map still repairs precisely.
         for ip in list(self._threads.keys()):
             self.unlimit(ip, known.get(ip))
 
@@ -1139,37 +1226,68 @@ class Limiter:
 # Protector — watch for ARP spoof aimed at us / gateway, auto-repair
 # --------------------------------------------------------------------------- #
 class Protector:
+    # Ignore repeats of the same (claimed-IP, attacker-MAC) for this long, so a
+    # spoof flood can't turn into one repair + 3 broadcasts per frame.
+    REPEAT_WINDOW = 5.0
+    # Don't let repairs pile up behind a blocked attacker.
+    REPAIR_INTERVAL = 1.0
+
     def __init__(self, net: Network, autofix=True):
         self.net = net
         self.autofix = autofix
         self._stop = threading.Event()
         self._thread = None
         self.hits = 0
+        self._lock = threading.Lock()
+        self._last_seen = {}    # (ip, mac) -> epoch, for repeat suppression
+        self._last_repair = 0.0  # epoch of last repair attempt
+
+    def _note(self, ip, mac):
+        """Count a hit and report whether it's new enough to act on."""
+        now = time.time()
+        with self._lock:
+            self.hits += 1
+            key = (ip, mac)
+            if now - self._last_seen.get(key, 0) < self.REPEAT_WINDOW:
+                return self.hits, False
+            self._last_seen[key] = now
+            due = now - self._last_repair >= self.REPAIR_INTERVAL
+            if due:
+                self._last_repair = now
+        return self.hits, due
 
     def _handle(self, pkt):
+        # Runs on the sniff thread: keep it cheap, hand repairs off to a worker.
         if not pkt.haslayer(ARP) or pkt[ARP].op != 2:
             return
         psrc, hwsrc = pkt[ARP].psrc, pkt[ARP].hwsrc
+        # Never flag levicut's OWN forgeries — when blocking and protecting at
+        # the same time, our own cut packets would otherwise "detect" a spoof
+        # and fight the block we just started.
+        if hwsrc.lower() == self.net.my_mac.lower():
+            return
         # Someone claims to be the gateway but with wrong MAC?
         if psrc == self.net.gateway_ip and hwsrc.lower() != self.net.gateway_mac.lower():
-            self.hits += 1
+            n, due = self._note(psrc, hwsrc)
             print(f"\n[!] SPOOF DETECTED: {psrc} claimed by {hwsrc} "
-                  f"(real: {self.net.gateway_mac}) [{self.hits}]")
-            if self.autofix:
-                self.repair()
+                  f"(real: {self.net.gateway_mac}) [{n}]")
+            if self.autofix and due:
+                threading.Thread(target=self.repair, daemon=True).start()
         # Someone claims to be US?
         elif psrc == self.net.my_ip and hwsrc.lower() != self.net.my_mac.lower():
-            self.hits += 1
+            n, _ = self._note(psrc, hwsrc)
             print(f"\n[!] SPOOF DETECTED: someone claims YOUR ip {psrc} "
-                  f"as {hwsrc} [{self.hits}]")
+                  f"as {hwsrc} [{n}]")
 
     def repair(self):
         net = self.net
-        # fix OUR table: pin correct gateway MAC
+        # Fix OUR table. nud reachable (NOT permanent): the kernel revalidates
+        # the entry, so a router reboot / mesh failover with a new MAC heals
+        # itself. permanent would pin us to a stale MAC indefinitely.
         try:
             subprocess.run(
                 ["ip", "neigh", "replace", net.gateway_ip, "lladdr",
-                 net.gateway_mac, "dev", net.iface, "nud", "permanent"],
+                 net.gateway_mac, "dev", net.iface, "nud", "reachable"],
                 check=False, capture_output=True, timeout=5,
             )
         except Exception:
@@ -1195,6 +1313,10 @@ class Protector:
 
     def stop(self):
         self._stop.set()
+        if self._thread:
+            # sniff() only evaluates stop_filter when a packet arrives, so a
+            # quiet LAN can leave the thread parked. Nudge it.
+            self._thread.join(timeout=1)
         print(f"[*] protection OFF ({self.hits} attacks seen)")
 
 
@@ -1210,6 +1332,28 @@ def find_device(devices, key):
         if d["ip"] == key or d["mac"].lower() == key.lower():
             return d
     return None
+
+
+def restore_target(blocker, limiter, devices, key):
+    """Stop blocking/limiting whatever `key` names and heal its ARP entry.
+    Returns a status line. Shared by `unlimit <n>` and `u<n>`."""
+    key = (key or "").strip()
+    if not key:
+        return "[?] usage: unlimit <n|ip>   (or u<n>)"
+    d = find_device(devices, key) if devices else None
+    ip = d["ip"] if d else (key if "." in key else None)
+    if not ip:
+        return "[!] bad index; scan first"
+    mac = d["mac"] if d else None
+    b = blocker.unblock(ip, mac)
+    l = limiter.unlimit(ip, mac)
+    if not (b or l):
+        # Nothing of ours was running for this IP, so nothing restored it. Push
+        # a correction anyway: a previous run (or a crashed one) may have left
+        # this host spoofed, and we have no thread state to undo.
+        blocker._restore(ip, mac)
+        return f"[+] not managed here, sent repair anyway: {ip}"
+    return f"[+] restored: {ip}"
 
 
 # --------------------------------------------------------------------------- #
@@ -1246,11 +1390,22 @@ def parse_args():
 
 
 def shutdown(blocker, limiter, known, protector=None):
+    """Restore ARP tables. Idempotent and hard to abort: a second Ctrl+C must
+    not leave victims spoofed, so every step swallows exceptions."""
     print("\n[*] Restoring ARP tables ...")
-    blocker.unblock_all(known)
-    limiter.unlimit_all(known)
+    try:
+        blocker.unblock_all(known)
+    except Exception as e:
+        print(f"[!] restore had a problem: {e}")
+    try:
+        limiter.unlimit_all(known)
+    except Exception as e:
+        print(f"[!] restore had a problem: {e}")
     if protector:
-        protector.stop()
+        try:
+            protector.stop()
+        except Exception:
+            pass
     print("[*] Done. Exiting.")
 
 
@@ -1357,6 +1512,7 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             shutdown(blocker, limiter, known_map())
         return
     if args.limit:
@@ -1376,6 +1532,7 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             shutdown(blocker, limiter, known_map())
         return
     if args.unblock or args.unlimit:
@@ -1397,11 +1554,19 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
-            protector.stop()
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            shutdown(blocker, limiter, known_map(), protector)
         return
 
     # ---- interactive ----
     def on_signal(*_):
+        # A second Ctrl+C must not abort the restore halfway, so ignore
+        # further signals while we put the ARP tables back.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
         shutdown(blocker, limiter, known_map(), protector)
         sys.exit(0)
 
@@ -1481,8 +1646,10 @@ def main():
                 # allow MAC directly without a scan
                 if re.match(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$", parts[2]):
                     mac = Whitelist.norm_mac(parts[2])
-                    wl.add(mac, parts[3] if len(parts) > 3 else "")
-                    print(f"[+] whitelisted {mac}")
+                    lbl = parts[3] if len(parts) > 3 else ""
+                    wl.add(mac, lbl)
+                    print(f"[+] whitelisted {mac}"
+                          + (f" as '{lbl}'" if lbl else ""))
                 else:
                     print("[!] scan first (press s), or give a MAC directly")
                 continue
@@ -1496,8 +1663,10 @@ def main():
             print_devices(devices, set(blocker.active), limiter.active, wl)
         elif low.startswith("wl del") or low.startswith("whitelist del") or \
                 low.startswith("wl rm") or low.startswith("unwl"):
-            parts = choice.split()
-            key = parts[-1] if len(parts) > 1 and parts[-1] not in ("del", "rm") else None
+            # keep multi-word labels intact: everything after 'del'/'rm' is the key
+            dp = choice.split(None, 2)
+            key = dp[2].strip() if len(dp) > 2 and dp[1].lower() in (
+                "del", "rm", "remove", "unwl") else None
             if not key:
                 print("[?] usage: wl del <n|ip|mac|label>")
                 continue
@@ -1540,7 +1709,7 @@ def main():
             if not devices:
                 print("[!] scan first (press s)")
                 continue
-            d = find_device(devices, parts[1])
+            d = find_device(devices, parts[1].rstrip("!"))
             try:
                 pct = int(parts[2])
             except ValueError:
@@ -1552,7 +1721,7 @@ def main():
             if d["ip"] in blocker.active:
                 print("[!] device is BLOCKED; unblock first (u<n>)")
                 continue
-            force = "!" in parts or "--force" in low
+            force = parts[1].endswith("!") or args.force
             reason = is_protected_target(d, wl, net)
             if reason and "whitelisted" in reason and force:
                 reason = None  # '<n>!' overrides whitelist, never self/gateway
@@ -1563,18 +1732,14 @@ def main():
             print(f"[+] {r}: {d['ip']} -> ~{pct}% speed")
         elif low.startswith("unlimit") or (low.startswith("u") and low[1:].strip().isdigit()):
             # unlimit <key> OR u<n> (unblock + unlimit both)
-            key = low.split()[1] if low.startswith("unlimit") else low[1:].strip()
-            d = find_device(devices, key) if devices else None
-            ip = d["ip"] if d else (key if "." in key else None)
-            if not ip:
-                print("[!] bad index; scan first")
-                continue
-            mac = d["mac"] if d else None
-            b = blocker.unblock(ip, mac)
-            l = limiter.unlimit(ip, mac)
-            if not mac:  # unknown mac -> still try broadcast repair via scan resync
-                blocker._restore(ip, mac) if False else None
-            print(f"[+] {'restored' if (b or l) else 'not managed'}: {ip}")
+            # `unlimit <key>` -> 2nd word; bare `unlimit` -> empty (usage);
+            # `u<n>` -> everything after the u.
+            uparts = low.split()
+            if low.startswith("unlimit"):
+                key = uparts[1] if len(uparts) > 1 else ""
+            else:
+                key = low[1:].strip()
+            print(restore_target(blocker, limiter, devices, key))
         elif low.split()[0].isdigit() or low.rstrip("!").strip().isdigit():
             if not devices:
                 print("[!] scan first (press s)")
